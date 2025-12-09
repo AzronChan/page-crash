@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>页面崩溃模拟 Demo</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica,
+          Arial, "Microsoft YaHei", sans-serif;
+        padding: 24px;
+      }
+      .wrap {
+        max-width: 720px;
+        margin: 0 auto;
+      }
+      button {
+        padding: 10px 16px;
+        font-size: 16px;
+        cursor: pointer;
+      }
+      .hint {
+        color: #666;
+        margin-top: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>页面崩溃模拟</h1>
+      <p>点击下方按钮后，页面会进入不可响应状态（类似崩溃）。</p>
+      <div style="display: flex; gap: 12px; margin: 12px 0">
+        <button id="crash-btn">触发页面崩溃（死循环阻塞）</button>
+        <button id="memory-btn">触发页面崩溃（内存暴涨）</button>
+        <button id="hash-btn">开始递增 URL Hash</button>
+      </div>
+      <p class="hint">提示：上述操作会让标签页不可响应，需手动关闭标签页。</p>
+    </div>
+
+    <script>
+      // 向 Service Worker 上报页面 tabId，并每 5s 发送心跳
+      (function setupSWTabHeartbeat() {
+        if (!("serviceWorker" in navigator)) return;
+
+        function postToSW(msg) {
+          if (navigator.serviceWorker.controller) {
+            navigator.serviceWorker.controller.postMessage(msg);
+          } else {
+            console.warn(
+              "No SW controller yet. Try reloading after registration."
+            );
+          }
+        }
+
+        function getTabIdSafe() {
+          try {
+            var exist = sessionStorage.getItem("__sentry_tab_id__");
+            if (exist) return exist;
+            var id = Date.now() + "-" + Math.random().toString(36).slice(2);
+            sessionStorage.setItem("__sentry_tab_id__", id);
+            return id;
+          } catch (e) {
+            return Date.now() + "-" + Math.random().toString(36).slice(2);
+          }
+        }
+
+        // 尝试在激活后获取 controller
+        navigator.serviceWorker.ready.then(() => {
+          try {
+            var tabId = getTabIdSafe();
+            let swHbTimer = null;
+
+            function start() {
+              if (swHbTimer) {
+                clearInterval(swHbTimer);
+                swHbTimer = null;
+              }
+              // 每 5 秒发送一次心跳到 SW
+              swHbTimer = setInterval(function () {
+                postToSW({ type: "heartbeat", tabId: tabId, ts: Date.now() });
+              }, 5000);
+              postToSW({ type: "heartbeat", tabId: tabId, ts: Date.now() });
+
+              postToSW({
+                type: 'sentry-config',
+                dsn : 'https://bab138ed63e34bf49c8c89aae2ee540a@sentry-fe.sentry.io/10',
+                env : 'production',
+                release : '0.0.1',
+              })
+            }
+
+            start();
+
+            // 正常退出：停止心跳并通知 SW 不再对该页面进行 15s 超时判断
+            function normalExit() {
+              if (swHbTimer) {
+                clearInterval(swHbTimer);
+                swHbTimer = null;
+              }
+              try {
+                postToSW({
+                  type: "exit",
+                  tabId: tabId,
+                  ts: Date.now(),
+                });
+              } catch (e) {}
+            }
+
+            window.addEventListener("beforeunload", normalExit);
+            window.addEventListener("pagehide", normalExit);
+            document.addEventListener("visibilitychange", function () {
+              if (document.visibilityState === "hidden") {
+                return normalExit()
+              } else if (document.visibilityState === "visible") {
+                start();
+              }
+            });
+
+            window.addEventListener("pageshow", function () {
+              start();
+            });
+
+          } catch (err) {
+            console.warn("setupSWTabHeartbeat failed", err);
+          }
+        });
+      })();
+
+      // 简单日志，便于你的 load/beforeunload 监控对比
+      document
+        .getElementById("crash-btn")
+        .addEventListener("click", function () {
+          console.log("[crash-demo] 即将触发崩溃（主线程死循环阻塞）");
+
+          // 给监控代码一个极短的缓冲时间（如需在点击后上报）
+          // 方式一：主线程无限死循环，阻塞渲染与事件循环，页面“假死”
+          // 注意：这会让页面完全不可交互，模拟崩溃效果
+          // 你也可以改为大量内存分配或递归队列以测试不同监控策略
+          // eslint-disable-next-line no-constant-condition
+          setTimeout(function () {
+            while (true) {}
+          }, 50);
+        });
+
+      // 内存暴涨模式：持续分配大块内存以触发内存耗尽或极度卡顿
+      (function setupMemoryBlow() {
+        var bigHolder = [];
+        var chunk = new Array(1e6).fill("X"); // 基础块：约 1e6 个字符
+
+        document
+          .getElementById("memory-btn")
+          .addEventListener("click", function () {
+            console.log("[crash-demo] 即将触发崩溃（内存暴涨）");
+            // 逐步推入大量数据，避免一次性分配被优化，且便于监控记录
+            // 注意：这会迅速占用内存，可能导致页面/进程崩溃
+            function allocate() {
+              // 每次推入一个较大的字符串，逐步膨胀
+              bigHolder.push(chunk.join(""));
+              // 使用 setTimeout 而非死循环，便于让事件循环间隙触发部分监控逻辑
+              setTimeout(allocate, 0);
+            }
+            // 预热几次后开始高速分配
+            setTimeout(allocate, 10);
+          });
+      })();
+
+      // 注册 Service Worker 并与其通信
+      function registerSW() {
+        if ("serviceWorker" in navigator) {
+          navigator.serviceWorker
+            .register("./sw-crash.js", { scope: "./" })
+            .then((reg) => {
+              console.log("[sw] registered", reg.scope);
+            })
+            .catch((err) => {
+              console.warn("[sw] register failed", err);
+            });
+
+          navigator.serviceWorker.addEventListener("message", (event) => {
+            const data = event.data || {};
+          });
+        } else {
+          console.warn("Service Worker not supported in this browser.");
+        }
+      }
+      registerSW();
+
+      // 持续递增 URL Hash（开始/停止切换）
+      (function setupHashIncrement() {
+        var running = false;
+        var timer = null;
+        var counter = 0;
+        var btn = document.getElementById("hash-btn");
+
+        function step() {
+          counter++;
+          // 将递增标记追加到 hash，避免过长可做滚动窗口
+          // 这里简单地覆盖为 #tick-<n>
+          try {
+            location.hash = "tick-" + counter;
+          } catch (e) {
+            console.warn("更新 hash 失败", e);
+          }
+        }
+
+        btn.addEventListener("click", function () {
+          step();
+        });
+      })();
+
+      const KEY = "__sentry_session_heartbeat__";
+      const TAB_ID_KEY = "__sentry_tab_id__";
+
+      /** 获取当前标签页的唯一标识，刷新还是同一个标识，多开能保证同一个标识，关闭重开？ */
+      function getTabId() {
+        try {
+          const exist = sessionStorage.getItem(TAB_ID_KEY);
+          if (exist) return exist;
+          const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          sessionStorage.setItem(TAB_ID_KEY, id);
+          return id;
+        } catch {
+          return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        }
+      }
+
+      /** 加载所有标签页的心跳记录 */
+      function loadAll() {
+        try {
+          const raw = localStorage.getItem(KEY);
+          return raw ? JSON.parse(raw) : {};
+        } catch {
+          return {};
+        }
+      }
+
+      /** 保存所有标签页的心跳记录 */
+      function saveAll(map) {
+        try {
+          localStorage.setItem(KEY, JSON.stringify(map));
+          console.log(map);
+        } catch {}
+      }
+
+      function writeHeartbeat(rec) {
+        const tabId = getTabId();
+        const map = loadAll();
+        map[tabId] = { ...map[tabId], ...rec, ts: Date.now(), tabId };
+        saveAll(map);
+      }
+
+      /** 正常退出 */
+      function markNormalExit() {
+        const tabId = getTabId();
+        const map = loadAll();
+        if (map[tabId]) {
+          map[tabId].normalExit = true;
+          saveAll(map);
+        }
+      }
+
+      function clearTabHeartbeat(tabId) {
+        const id = tabId || getTabId();
+        const map = loadAll();
+        if (map[id]) {
+          delete map[id];
+          saveAll(map);
+        }
+      }
+
+      /** 当前标签页周期性心跳写入 */
+      function startSessionHeartbeat(intervalMs = 3000, recBase) {
+        const page = `${window.location.pathname}${window.location.hash || ""}`;
+        let timer = null;
+
+        function beat() {
+          writeHeartbeat({
+            page,
+            version: recBase?.version,
+            env: recBase?.env,
+            meta: recBase?.meta,
+            normalExit: false,
+          });
+        }
+
+        function startBeat() {
+          beat();
+          if (timer) {
+            clearInterval(timer);
+            timer = setInterval(beat, intervalMs);
+          }
+        }
+        startBeat();
+
+        function normalExit() {
+          markNormalExit();
+          if (timer) clearInterval(timer);
+          clearTabHeartbeat();
+        }
+
+        window.addEventListener("beforeunload", () => {
+          normalExit();
+        });
+
+        const visibilityHandler = () => {
+          localStorage.setItem("visibilitychange", document.visibilityState);
+          if (document.visibilityState === "hidden") {
+            normalExit();
+          } else if (document.visibilityState === "visible") {
+            startBeat();
+          }
+        };
+
+        const pageHideHandler = () => {
+          normalExit();
+          console.log(111);
+          localStorage.setItem("pagehide", 1);
+        };
+
+        // 正常关闭浏览器时会触发 visibilitychange
+        document.addEventListener("visibilitychange", visibilityHandler);
+        // 正常关闭浏览器时会触发 pagehide，比 beforeunload 更可靠
+        window.addEventListener("pagehide", pageHideHandler);
+        window.addEventListener("pageshow", () => {
+          console.log(
+            "%c [ pageshow ]-192",
+            "font-size:13px; background:pink; color:#bf2c9f;"
+          );
+          startBeat();
+        });
+
+        return () => {
+          if (timer) clearInterval(timer);
+        };
+      }
+
+      /** 启动时检查其他标签页的异常终止并补报 */
+      function checkPreviousAbnormalExit(timeoutMs, report) {
+        const now = Date.now();
+        const currentTab = getTabId();
+        console.log(
+          "%c [ currentTab 当前页面 ]-173",
+          "font-size:13px; background:pink; color:#bf2c9f;",
+          currentTab
+        );
+        const map = loadAll();
+
+        let changed = false;
+        const stores = Object.values(map);
+        console.log(
+          "%c [ stores ]-178",
+          "font-size:13px; background:pink; color:#bf2c9f;",
+          stores
+        );
+        stores.forEach((rec) => {
+          if (!rec || rec.tabId === currentTab) {
+            console.log(
+              "%c [ 刷新 ]-179",
+              "font-size:13px; background:pink; color:#bf2c9f;"
+            );
+            return;
+          }
+          const diff = now - (rec.ts || 0);
+          console.log(
+            "%c [ diff ]-186",
+            "font-size:13px; background:pink; color:#bf2c9f;",
+            diff,
+            rec.tabId,
+            new Date(rec.ts || 0).toISOString()
+          );
+
+          if (!rec.normalExit && diff > timeoutMs) {
+            // 不是正常退出时，normalExit 为 false
+            // 当崩溃时，normalExit 为false 或 undefined
+            // diff > timeoutMs 主要是为了当多开页面时，正常的页面心跳时间一直在滚动更新，不会少于timeoutMs，防止误报
+            // diff > timeoutMs 有个弊端，当用户崩溃后，刚好设了一个时间戳，并且马上打开一个新标签页，这时diff可能还没超过timeoutMs，这种情况会漏报
+
+            // report({ ...rec, diff });
+            console.log(
+              "[sentry-session-heartbeat] 检测到异常终止标签页",
+              rec.tabId,
+              "，已上报"
+            );
+            delete map[rec.tabId];
+            changed = true;
+          } else if (rec.normalExit) {
+            delete map[rec.tabId];
+            changed = true;
+          }
+        });
+
+        if (changed) saveAll(map);
+      }
+      //   checkPreviousAbnormalExit(4000);
+      //   startSessionHeartbeat(3000, { version: "11.1", env: "production" });
+      console.log(localStorage.valueOf());
+    </script>
+  </body>
+</html>
